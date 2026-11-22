@@ -1,4 +1,4 @@
-"""Question stream builder (owner: Naveena).
+"""Question stream builder.
 
 A stream is the order in which questions reach the system. Each source
 question is asked first; its two paraphrases and its look-alike arrive later;

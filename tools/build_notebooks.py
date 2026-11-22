@@ -20,6 +20,13 @@ else:
 subprocess.run([sys.executable, "-m", "pip", "install", "-q", "faiss-cpu", "bitsandbytes>=0.43"], check=True)
 os.chdir("/kaggle/working/repo")
 sys.path.insert(0, "src")
+import glob
+def find_input(name):
+    # Kaggle mounts datasets at /kaggle/input/<name> or /kaggle/input/datasets/<owner>/<name>
+    hits = [h for h in glob.glob(f"/kaggle/input/**/{{name}}", recursive=True) if os.path.isdir(h)]
+    if not hits:
+        raise FileNotFoundError(f"Add the dataset {{name}} with Add Input")
+    return hits[0]
 print("ready")"""
 
 
@@ -40,7 +47,7 @@ def save(cells, name):
 
 
 prepare = [
-    md("# DSA 4 · 00 Prepare data (Naveena, Day 1)\n\nSettings: **GPU T4**, **Internet on**. "
+    md("# DSA 4 · 00 Prepare data (Day 1)\n\nSettings: **GPU T4**, **Internet on**. "
        "Samples 1,000 TriviaQA + 1,000 HotpotQA questions, makes the splits and blocks, builds the "
        "FAISS index. Publish `/kaggle/working/data` as the dataset **dsa4-data**."),
     code(SETUP),
@@ -51,18 +58,19 @@ prepare = [
 generate = [
     md("# DSA 4 · 01 Generate my block (everyone, Day 1 evening)\n\n"
        "Settings: **GPU T4**, **Internet on**. Add Input → **dsa4-data**.\n\n"
-       "1. Set `BLOCK` below (Naveena 1, Manimegalai 2, Meet 3, Vijaya 4).\n"
+       "1. Set `BLOCK` below to your block number (see the plan).\n"
        "2. Run the setup cell and the **smoke test** (20 questions) interactively. Post the printed "
        "seconds per question in the team chat.\n"
        "3. Comment out the smoke test, then **Save Version → Save & Run All** for the full block.\n"
        "4. Next morning: Output → **New Dataset** `dsa4-block-<BLOCK>` (later runs: New Version)."),
     code(SETUP),
     code('BLOCK = 1      # <- change to your block\n'
-         'DATA = "/kaggle/input/dsa4-data"\n'
+         'DATA = find_input("dsa4-data")\n'
          'OUT = f"/kaggle/working/block{BLOCK}"\n'
          'MODEL = "Qwen/Qwen2.5-7B-Instruct"   # fallback: "Qwen/Qwen2.5-3B-Instruct"\n'
          '# If you are resuming, add your own dsa4-block-<BLOCK> dataset as input and set:\n'
-         'RESUME = ""  # e.g. f"/kaggle/input/dsa4-block-{BLOCK}/block{BLOCK}.jsonl"'),
+         'RESUME = ""  # e.g. find_input(f"dsa4-block-{BLOCK}") + f"/block{BLOCK}.jsonl"\n'
+         'print(DATA)'),
     code('# Smoke test: 20 questions. Check the answers are short and the variants look right.\n'
          '!python scripts/generate_block.py --block {BLOCK} --data {DATA} --out /kaggle/working/smoke '
          '--model {MODEL} --limit 20\n'
@@ -77,12 +85,13 @@ generate = [
 ]
 
 merge = [
-    md("# DSA 4 · 02 Merge blocks (Naveena, Day 2)\n\nSettings: CPU is enough. Add Input → **dsa4-data** "
+    md("# DSA 4 · 02 Merge blocks (Day 2)\n\nSettings: CPU is enough. Add Input → **dsa4-data** "
        "and all four **dsa4-block-N** datasets. Publish `/kaggle/working/cache` as **dsa4-cache**."),
     code(SETUP),
-    code("!python scripts/merge_blocks.py --data /kaggle/input/dsa4-data "
-         "--blocks /kaggle/input/dsa4-block-1 /kaggle/input/dsa4-block-2 "
-         "/kaggle/input/dsa4-block-3 /kaggle/input/dsa4-block-4 --out /kaggle/working/cache"),
+    code('DATA = find_input("dsa4-data")\n'
+         'BLOCKS = " ".join(find_input(f"dsa4-block-{i}") for i in range(1, 5))\n'
+         'print(DATA); print(BLOCKS)\n'
+         '!python scripts/merge_blocks.py --data {DATA} --blocks {BLOCKS} --out /kaggle/working/cache'),
     code('import pandas as pd\n'
          'c = pd.read_json("/kaggle/working/cache/cache.jsonl", lines=True)\n'
          'acc = pd.DataFrame({"direct": c["direct"].str["correct"], "rag": c["rag"].str["correct"], '

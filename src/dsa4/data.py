@@ -1,4 +1,4 @@
-"""Question sampling, splits and block assignment (owner: Naveena).
+"""Question sampling, splits and block assignment.
 
 Everything is seeded, so running it twice gives the same questions,
 the same splits and the same blocks.

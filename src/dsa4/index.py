@@ -1,4 +1,4 @@
-"""Passages, embeddings and the FAISS index used for RAG (owner: Naveena).
+"""Passages, embeddings and the FAISS index used for RAG.
 
 One index pools the passages of all 2,000 sampled questions:
 HotpotQA paragraphs as they are, TriviaQA Wikipedia pages cut into ~100-word chunks.

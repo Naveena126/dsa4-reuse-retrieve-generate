@@ -1,4 +1,4 @@
-"""Task 1 (Naveena): simulate a semantic cache over a question stream.
+"""Task 1: simulate a semantic cache over a question stream.
 
 Every query is compared with the entries already in the cache. If the rule
 says "reuse", the cached answer is served; otherwise the query is answered
