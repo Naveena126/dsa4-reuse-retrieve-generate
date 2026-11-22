@@ -1,0 +1,10 @@
+# large or private files: never commit
+data/
+cache/
+*.faiss
+*.npy
+*.npz
+kaggle.json
+.venv/
+__pycache__/
+.ipynb_checkpoints/

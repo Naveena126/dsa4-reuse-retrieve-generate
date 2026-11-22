@@ -1,0 +1,14 @@
+numpy
+pandas
+faiss-cpu
+datasets
+sentence-transformers
+transformers>=4.44
+accelerate
+bitsandbytes
+torch
+spacy
+lightgbm
+scikit-learn
+matplotlib
+pytest
