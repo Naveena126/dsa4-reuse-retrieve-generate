@@ -7,7 +7,7 @@ from pathlib import Path
 
 import nbformat as nbf
 
-REPO_URL = "https://github.com/YOUR-USERNAME/dsa4-reuse-retrieve-generate.git"
+REPO_URL = "https://github.com/Naveena126/dsa4-reuse-retrieve-generate.git"
 ROOT = Path(__file__).resolve().parents[1]
 
 SETUP = f"""# Setup: clone the team repository and install what Kaggle lacks
