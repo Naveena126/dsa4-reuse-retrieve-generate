@@ -33,14 +33,32 @@ def test_total_cost(weights):
 
 def test_cheapest_correct_action(weights):
     candidates = [
-        {"action": "call_7b", "correct": True},
-        {"action": "retrieval", "correct": True},
-        {"action": "call_3b", "correct": False},
+        {"action": "direct", "correct": True},
+        {"action": "rag", "correct": True},
     ]
 
     best = cheapest_correct_action(candidates, weights)
-    assert best["action"] == "retrieval"
-    assert best["oracle_cost"] == 1
+    assert best["action"] == "direct"
+    assert best["oracle_cost"] == 10
+
+
+def test_rag_oracle_cost_includes_retrieval(weights):
+    candidates = [{"action": "rag", "correct": True}]
+
+    best = cheapest_correct_action(candidates, weights)
+    assert best["action"] == "rag"
+    assert best["oracle_cost"] == 11
+
+
+def test_oracle_selects_rag_when_direct_is_incorrect(weights):
+    candidates = [
+        {"action": "direct", "correct": False},
+        {"action": "rag", "correct": True},
+    ]
+
+    best = cheapest_correct_action(candidates, weights)
+    assert best["action"] == "rag"
+    assert best["oracle_cost"] == 11
 
 
 def test_no_correct_candidate(weights):
@@ -54,8 +72,8 @@ def test_no_correct_candidate(weights):
 
 def test_oracle_question_filter(weights):
     candidates = [
-        {"question_id": 1, "action": "call_7b", "correct": True},
-        {"question_id": 2, "action": "retrieval", "correct": True},
+        {"question_id": 1, "action": "direct", "correct": True},
+        {"question_id": 2, "action": "rag", "correct": True},
     ]
 
     best = cheapest_correct_action(
@@ -64,7 +82,7 @@ def test_oracle_question_filter(weights):
         question_id=1,
     )
 
-    assert best["action"] == "call_7b"
+    assert best["action"] == "direct"
 
 
 def test_latency_log():
