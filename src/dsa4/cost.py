@@ -87,7 +87,12 @@ def cheapest_correct_action(
     weights: CostWeights,
     question_id: Any = None,
 ) -> dict[str, Any] | None:
-    """Oracle baseline: select the cheapest correct candidate."""
+    """Oracle: select the cheapest correct direct or RAG answer."""
+
+    action_costs = {
+        "direct": total_cost(["call_7b"], weights),
+        "rag": total_cost(["retrieval", "call_7b"], weights),
+    }
 
     eligible = [
         candidate
@@ -102,11 +107,14 @@ def cheapest_correct_action(
     if not eligible:
         return None
 
-    best = min(
-        eligible,
-        key=lambda candidate: call_cost(candidate["action"], weights),
-    )
+    def candidate_cost(candidate: dict[str, Any]) -> float:
+        action = candidate["action"]
+        if action not in action_costs:
+            raise ValueError(f"Unknown answer action: {action}")
+        return action_costs[action]
+
+    best = min(eligible, key=candidate_cost)
 
     result = dict(best)
-    result["oracle_cost"] = call_cost(best["action"], weights)
+    result["oracle_cost"] = candidate_cost(best)
     return result
