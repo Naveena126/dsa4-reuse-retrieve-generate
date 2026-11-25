@@ -1,0 +1,579 @@
+"""Builds notebooks/ManimegalaiKumarPeriyasamy_Retrieval_Trigger.ipynb (Task 2).
+
+    python tools/build_task2_notebook.py
+
+Covers every Task 2 requirement from the DSA 4 Modeling Tasks & 6-day plan:
+  - Offline baselines: V1 (never / always retrieve), V2 (token log-prob), V3 (predictive entropy), Oracle
+  - V4 fine-tuned DistilBERT-base (66M) complexity classifier on silver labels (with class weighting)
+  - Zero-retuning TriviaQA -> HotpotQA transfer across seeds 0-2 (mean +/- std)
+  - Efficiency metrics: retrievals/1k, generated tokens/1k (1-pass pre-gen vs 2-pass post-gen),
+    weighted cost/1k (`dsa4.cost`), median & p95 latency (ms)
+  - Deeper analysis: calibration (ECE, Brier, reliability diagrams) & confident-but-wrong failure audit
+  - Shared final pipeline comparison cell (best of Tasks 1-4 vs always-retrieve vs oracle)
+"""
+
+from pathlib import Path
+
+import nbformat as nbf
+
+from build_notebooks import REPO_URL, code, md
+
+ROOT = Path(__file__).resolve().parents[1]
+
+SETUP_TASK2 = f"""# Setup: clone/update the team repository and locate Kaggle inputs
+import glob, os, subprocess, sys
+
+REPO_URL = "{REPO_URL}"
+REPO_BRANCH = "develop"  # switch to e.g. "task2-retrieval-trigger" before PR merge, or "main" at defense
+
+if os.path.exists("/kaggle/working"):
+    repo_dir = "/kaggle/working/repo"
+    if not os.path.exists(repo_dir):
+        subprocess.run(["git", "clone", "-q", "-b", REPO_BRANCH, REPO_URL, repo_dir], check=True)
+    else:
+        subprocess.run(["git", "-C", repo_dir, "fetch", "-q", "origin"], check=True)
+        subprocess.run(["git", "-C", repo_dir, "checkout", "-q", REPO_BRANCH], check=True)
+        subprocess.run(["git", "-C", repo_dir, "pull", "-q", "origin", REPO_BRANCH], check=True)
+    os.chdir(repo_dir)
+
+sys.path.insert(0, os.path.abspath("src"))
+
+def find_input(name):
+    # Kaggle mounts datasets at /kaggle/input/<name> or /kaggle/input/datasets/<owner>/<name>
+    hits = [h for h in glob.glob(f"/kaggle/input/**/{{name}}", recursive=True) if os.path.isdir(h)]
+    if not hits:
+        raise FileNotFoundError(f"Add the dataset '{{name}}' via Kaggle Add Input")
+    return hits[0]
+
+import torch
+print("Working dir:", os.getcwd())
+print("PyTorch:", torch.__version__, "| CUDA available:", torch.cuda.is_available(),
+      f"({{torch.cuda.get_device_name(0)}})" if torch.cuda.is_available() else "")"""
+
+cells = [
+    md(
+        "# Task 2 · Retrieval Trigger (When to Use RAG)\n"
+        "**Owner:** Manimegalai Kumar Periyasamy · DSA 4 (Action Learning)\n\n"
+        "**Research question:** When does an LLM need external retrieval (RAG) before answering, which "
+        "trigger matches always-RAG accuracy with the fewest retrievals, and do thresholds tuned on "
+        "single-hop questions (**TriviaQA**) transfer unchanged to multi-hop questions (**HotpotQA**)?\n\n"
+        "**Kaggle settings:** **GPU T4** (needed for V4 DistilBERT fine-tuning; V1–V3 run offline on CPU), "
+        "**Internet on** (to pull `distilbert-base-uncased` and the team repo). "
+        "**Add Input** → `dsa4-data` and `dsa4-cache`."
+    ),
+    md(
+        "## 1. Introduction\n\n"
+        "In a production LLM question-answering pipeline, *always retrieving* external evidence wastes "
+        "retrieval and prompt-token budgets on facts the model already knows (and can inject distracting "
+        "passages), while *never retrieving* causes hallucinations on unfamiliar or multi-hop questions.\n\n"
+        "Following **Moskvoretskii et al. (ACL 2025)** and **Jeong et al. (NAACL 2024, Adaptive-RAG)**, "
+        "this notebook compares four decision policies under a strict fair-comparison protocol (identical "
+        "generator `Qwen2.5-7B-Instruct`, identical prompt, identical `bge-base-en-v1.5` + FAISS top-5 index, "
+        "and **no semantic cache** in Task 2):\n\n"
+        "- **V1 Fixed baselines:** Never retrieve (`V1a`) and Always retrieve (`V1b`).\n"
+        "- **V2 Token log-probability (post-generation):** Retrieve if the length-normalised log-probability "
+        "of the direct answer falls below a threshold.\n"
+        "- **V3 Predictive entropy (post-generation):** Retrieve if the mean token entropy of the direct "
+        "answer exceeds a threshold.\n"
+        "- **V4 Complexity classifier (pre-generation):** `DistilBERT-base` (66M) fine-tuned on question "
+        "text to predict silver labels (*did retrieval fix a wrong direct answer?*).\n\n"
+        "**Hypothesis:** Output-uncertainty triggers (V2, V3) will approach always-retrieve accuracy on "
+        "TriviaQA with far fewer retrievals, but under-retrieve on HotpotQA due to overconfidence on "
+        "multi-hop questions; the pre-generation DistilBERT classifier (V4) avoids paying two LLM passes "
+        "on triggered queries and is tested for stronger transfer."
+    ),
+    md("## 2. Setup and data"),
+    code(SETUP_TASK2),
+    code(
+        'from pathlib import Path\n'
+        'import numpy as np\n'
+        'import pandas as pd\n'
+        'import matplotlib.pyplot as plt\n\n'
+        'from dsa4 import cost, data, evaluate, retrieval\n\n'
+        'MET, FIG = Path("results/metrics"), Path("results/figures")\n'
+        'MET.mkdir(parents=True, exist_ok=True)\n'
+        'FIG.mkdir(parents=True, exist_ok=True)\n\n'
+        '# Locate questions.jsonl (dsa4-data) and cache.jsonl (dsa4-cache)\n'
+        'DATA_DIR = Path(glob.glob(find_input("dsa4-data") + "/**/questions.jsonl", recursive=True)[0]).parent\n'
+        'CACHE_PATH = glob.glob(find_input("dsa4-cache") + "/**/cache.jsonl", recursive=True)[0]\n\n'
+        'q_df = data.load_questions(DATA_DIR)\n'
+        'cache_df = pd.read_json(CACHE_PATH, lines=True)\n'
+        'df = retrieval.prepare_retrieval_frame(q_df, cache_df)\n\n'
+        'print(f"Loaded {len(df)} source questions from {CACHE_PATH}")\n'
+        'display(df.groupby("dataset")[["split_s0"]].value_counts().unstack(fill_value=0))'
+    ),
+    md(
+        "## 3. Data exploration and silver labels\n\n"
+        "For every source question we have both the direct answer and the top-5 RAG answer from the shared "
+        "cache, scored against all accepted aliases with `dsa4.evaluate` (normalised Exact Match & token F1).\n\n"
+        "Silver labels for Task 2:\n"
+        "- **`retrieval_helps` (`RAG=1, Direct=0`)**: questions where retrieval strictly fixes a wrong direct answer.\n"
+        "- **`retrieval_hurts` (`Direct=1, RAG=0`)**: questions where distracting passages break a correct direct answer."
+    ),
+    code(
+        'eda = df.groupby("dataset").agg(\n'
+        '    n_questions=("qid", "count"),\n'
+        '    direct_EM=("direct_em", "mean"),\n'
+        '    rag_EM=("rag_em", "mean"),\n'
+        '    direct_F1=("direct_f1", "mean"),\n'
+        '    rag_F1=("rag_f1", "mean"),\n'
+        '    retrieval_helps_rate=("retrieval_helps", "mean"),\n'
+        '    retrieval_helps_n=("retrieval_helps", "sum"),\n'
+        '    retrieval_hurts_rate=("retrieval_hurts", "mean"),\n'
+        '    mean_direct_logprob=("direct_logprob", "mean"),\n'
+        '    mean_direct_entropy=("direct_entropy", "mean"),\n'
+        '    mean_direct_tokens=("direct_n_tokens", "mean"),\n'
+        '    mean_rag_tokens=("rag_n_tokens", "mean"),\n'
+        '    mean_direct_lat_s=("direct_latency_s", "mean"),\n'
+        '    mean_rag_lat_s=("rag_latency_s", "mean"),\n'
+        ').round(3)\n'
+        'eda.to_csv(MET / "task2_eda_summary.csv")\n'
+        'display(eda)\n\n'
+        '# Check class balance of silver labels across splits (seed 0)\n'
+        'display(df.groupby(["dataset", "split_s0"])["retrieval_helps"].agg(["count", "sum", "mean"]).round(3))'
+    ),
+    code(
+        '# Uncertainty score distributions: direct-correct vs retrieval-helps on TriviaQA vs HotpotQA\n'
+        'fig, axes = plt.subplots(2, 2, figsize=(11, 7), sharex="col")\n'
+        'for row_idx, ds in enumerate(["triviaqa", "hotpotqa"]):\n'
+        '    sub = df[df["dataset"] == ds]\n'
+        '    helps = sub[sub["retrieval_helps"] == 1]\n'
+        '    no_help = sub[sub["retrieval_helps"] == 0]\n\n'
+        '    ax = axes[row_idx, 0]\n'
+        '    ax.hist(no_help["direct_logprob"].dropna(), bins=25, alpha=0.6, density=True, label="No help / direct OK")\n'
+        '    ax.hist(helps["direct_logprob"].dropna(), bins=25, alpha=0.6, density=True, label="Retrieval helps (RAG=1, Dir=0)")\n'
+        '    ax.set_title(f"{ds.upper()} · Direct mean log-probability")\n'
+        '    ax.set_ylabel("Density"); ax.grid(alpha=0.25); ax.legend(fontsize=8)\n\n'
+        '    ax = axes[row_idx, 1]\n'
+        '    ax.hist(no_help["direct_entropy"].dropna(), bins=25, alpha=0.6, density=True, label="No help / direct OK")\n'
+        '    ax.hist(helps["direct_entropy"].dropna(), bins=25, alpha=0.6, density=True, label="Retrieval helps (RAG=1, Dir=0)")\n'
+        '    ax.set_title(f"{ds.upper()} · Direct mean predictive entropy")\n'
+        '    ax.grid(alpha=0.25); ax.legend(fontsize=8)\n\n'
+        'axes[1, 0].set_xlabel("Length-normalised token log-probability (higher = more confident)")\n'
+        'axes[1, 1].set_xlabel("Mean predictive entropy in nats (higher = more uncertain)")\n'
+        'fig.tight_layout()\n'
+        'fig.savefig(FIG / "task2_score_distributions.png", dpi=150)\n'
+        'plt.show()'
+    ),
+    md(
+        "## 4. Method and fair-comparison protocol\n\n"
+        "- **Splits & seeds:** 60/20/20 train/val/test by source question, stratified by dataset, over "
+        "seeds `0, 1, 2` (reported as `mean ± std` via `dsa4.evaluate.aggregate_seed_results`).\n"
+        "- **Threshold tuning:** For each trigger, sweep thresholds on **TriviaQA validation** (`split_s{seed} == 'val'`) "
+        "and select the threshold achieving `EM >= always_RAG_EM - EM_TOL` (`EM_TOL = 0.01`) with the **lowest retrieval rate**.\n"
+        "- **Zero-retuning transfer:** Apply the TriviaQA-tuned threshold **unchanged** to **HotpotQA test**, "
+        "and compare against an in-domain HotpotQA-tuned threshold as an upper reference.\n"
+        "- **Cost & token accounting (`dsa4.cost`):**\n"
+        "  - `CostWeights(lookup=0, retrieval=1, call_3b=3, call_7b=10)`.\n"
+        "  - **Post-generation triggers (V2, V3)** run the direct 7B pass first; triggered queries incur "
+        "retrieval + a **second** 7B RAG pass (`tokens = direct + rag`, `cost = 10 + 1 + 10 = 21`).\n"
+        "  - **Pre-generation policies (V1, V4 DistilBERT)** decide *before* generation and pay a **single** "
+        "7B pass per query (`cost = 10` direct, `11` RAG), plus DistilBERT inference latency (~ms)."
+    ),
+    code(
+        'SEEDS = (0, 1, 2)\n'
+        'EM_TOL = 0.01  # match always-RAG EM within 1 percentage point at minimum retrieval rate\n'
+        'COST_WEIGHTS = cost.CostWeights(lookup=0.0, retrieval=1.0, call_3b=3.0, call_7b=10.0)\n'
+        'print("Cost weights:", COST_WEIGHTS.as_dict(), "| EM tolerance:", EM_TOL)'
+    ),
+    md("## 5. Offline baselines: V1 (fixed), V2 (log-probability), and V3 (entropy)"),
+    code(
+        'offline_seed_df, offline_summary = retrieval.evaluate_triggers_across_seeds(\n'
+        '    df, seeds=SEEDS, em_tolerance=EM_TOL, weights=COST_WEIGHTS\n'
+        ')\n'
+        'evaluate.save_results_table(offline_seed_df, MET / "task2_offline_by_seed.csv")\n'
+        'evaluate.save_results_table(offline_summary, MET / "task2_offline_summary.csv")\n\n'
+        'cols_show = ["eval_set", "method", "n_seeds", "threshold", "EM", "F1",\n'
+        '             "retrieval_rate", "auroc_helps", "retrievals_per_1k", "tokens_per_1k", "cost_per_1k"]\n'
+        'display(evaluate.format_results_table(offline_summary)[cols_show])'
+    ),
+    code(
+        '# Seed-0 EM vs retrieval-rate curves for offline triggers (V2 & V3) on TriviaQA & HotpotQA test\n'
+        'fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.3), sharey=False)\n'
+        'for ax, ds, title in [\n'
+        '    (axes[0], "triviaqa", "TriviaQA test (in-domain, seed 0)"),\n'
+        '    (axes[1], "hotpotqa", "HotpotQA test (zero-retuning transfer, seed 0)"),\n'
+        ']:\n'
+        '    tq_val = df[(df["dataset"] == "triviaqa") & (df["split_s0"] == "val")]\n'
+        '    test_sub = df[(df["dataset"] == ds) & (df["split_s0"] == "test")]\n\n'
+        '    for label, col, direction, color in [\n'
+        '        ("V2 Log-prob", "direct_logprob", "below", "#1f77b4"),\n'
+        '        ("V3 Entropy", "direct_entropy", "above", "#ff7f0e"),\n'
+        '    ]:\n'
+        '        c_val = retrieval.sweep_thresholds(tq_val, tq_val[col], direction=direction, is_pre_generation=False, weights=COST_WEIGHTS)\n'
+        '        t_star = retrieval.pick_threshold(c_val, always_rag_em=float(tq_val["rag_em"].mean()), em_tolerance=EM_TOL)\n'
+        '        c_test = retrieval.sweep_thresholds(test_sub, test_sub[col], direction=direction, is_pre_generation=False, weights=COST_WEIGHTS)\n'
+        '        op = retrieval.evaluate_policy(test_sub, retrieval.apply_threshold(test_sub[col], t_star, direction), is_pre_generation=False, weights=COST_WEIGHTS)\n'
+        '        ax.plot(c_test["retrieval_rate"] * 100, c_test["EM"] * 100, label=label, color=color, lw=2)\n'
+        '        ax.scatter([op["retrieval_rate"] * 100], [op["EM"] * 100], color=color, edgecolor="black", s=65, zorder=5)\n\n'
+        '    never_em = float(test_sub["direct_em"].mean()) * 100\n'
+        '    always_em = float(test_sub["rag_em"].mean()) * 100\n'
+        '    oracle = retrieval.evaluate_oracle(test_sub, weights=COST_WEIGHTS)\n'
+        '    ax.axhline(always_em, color="grey", ls="--", lw=1.2, label=f"V1b Always RAG ({always_em:.1f}%)")\n'
+        '    ax.axhline(never_em, color="grey", ls=":", lw=1.2, label=f"V1a Never RAG ({never_em:.1f}%)")\n'
+        '    ax.scatter([oracle["retrieval_rate"] * 100], [oracle["EM"] * 100], marker="*", s=140, color="green", zorder=6, label="Oracle")\n'
+        '    ax.set_title(title); ax.set_xlabel("Retrieval rate (%)"); ax.set_ylabel("Exact Match (%)")\n'
+        '    ax.grid(alpha=0.25); ax.legend(fontsize=8, loc="lower right")\n\n'
+        'fig.tight_layout()\n'
+        'fig.savefig(FIG / "task2_offline_curves.png", dpi=150)\n'
+        'plt.show()'
+    ),
+    md(
+        "## 6. V4: Fine-tuned DistilBERT-base (66M) complexity classifier\n\n"
+        "Simplified from **Jeong et al. (2024, Adaptive-RAG)** into a binary pre-generation router: "
+        "`distilbert-base-uncased` takes only the **question text** and predicts whether retrieval helps "
+        "(`rag_em == 1` and `direct_em == 0`).\n\n"
+        "- Trained with **balanced class weights** on the training split only (`split_s{seed} == 'train'`).\n"
+        "- **Backup rule (from Modeling Tasks):** if the TriviaQA training split has fewer than `MIN_POS = 30` "
+        "positive `retrieval_helps` examples, automatically pools TriviaQA + HotpotQA training splits with "
+        "class weighting (logged explicitly below); otherwise trains purely on TriviaQA train to test true "
+        "zero-shot transfer to HotpotQA."
+    ),
+    code(
+        'DISTILBERT_MODEL = "distilbert-base-uncased"\n'
+        'EPOCHS = 4\n'
+        'BATCH_SIZE = 16\n'
+        'LR = 2e-5\n'
+        'MIN_POS = 30\n'
+        'POOL_IF_FEW_POSITIVES = True\n\n'
+        'v4_probs_by_seed = {}\n'
+        'v4_latency_ms_by_seed = {}\n'
+        'v4_histories = []\n'
+        'v4_pred_rows = []\n'
+        'tfidf_aurocs = []\n\n'
+        'for seed in SEEDS:\n'
+        '    scol = f"split_s{seed}"\n'
+        '    tq_train = df[(df["dataset"] == "triviaqa") & (df[scol] == "train")].reset_index(drop=True)\n'
+        '    tq_val = df[(df["dataset"] == "triviaqa") & (df[scol] == "val")].reset_index(drop=True)\n\n'
+        '    n_pos = int(tq_train["retrieval_helps"].sum())\n'
+        '    if POOL_IF_FEW_POSITIVES and n_pos < MIN_POS:\n'
+        '        train_df = df[df[scol] == "train"].reset_index(drop=True)\n'
+        '        val_df = df[df[scol] == "val"].reset_index(drop=True)\n'
+        '        train_regime = f"pooled (TriviaQA pos={n_pos} < {MIN_POS})"\n'
+        '    else:\n'
+        '        train_df, val_df = tq_train, tq_val\n'
+        '        train_regime = f"TriviaQA-only (pos={n_pos}/{len(tq_train)})"\n\n'
+        '    print(f"[Seed {seed}] Training V4 DistilBERT ({train_regime}) ...")\n'
+        '    model, tok, hist = retrieval.train_distilbert_trigger(\n'
+        '        train_df,\n'
+        '        val_df,\n'
+        '        target_col="retrieval_helps",\n'
+        '        model_name=DISTILBERT_MODEL,\n'
+        '        seed=seed,\n'
+        '        epochs=EPOCHS,\n'
+        '        batch_size=BATCH_SIZE,\n'
+        '        lr=LR,\n'
+        '        use_class_weight=True,\n'
+        '    )\n'
+        '    hist["seed"] = seed\n'
+        '    hist["train_regime"] = train_regime\n'
+        '    v4_histories.append(hist)\n\n'
+        '    # Score all questions (eval uses only val for tuning and test for reporting)\n'
+        '    probs, lat_ms = retrieval.predict_distilbert_proba(model, tok, df["question"].tolist(), batch_size=64)\n'
+        '    v4_probs_by_seed[seed] = dict(zip(df["qid"], probs))\n'
+        '    v4_latency_ms_by_seed[seed] = lat_ms\n\n'
+        '    for qid, ds, sp, y_h, p in zip(df["qid"], df["dataset"], df[scol], df["retrieval_helps"], probs):\n'
+        '        v4_pred_rows.append({"seed": seed, "qid": qid, "dataset": ds, "split": sp,\n'
+        '                             "retrieval_helps": int(y_h), "v4_prob": float(p)})\n\n'
+        '    # Quick lexical sanity check (TF-IDF + balanced LogisticRegression)\n'
+        '    tfidf = retrieval.train_tfidf_trigger(train_df, target_col="retrieval_helps", seed=seed)\n'
+        '    for ds in ("triviaqa", "hotpotqa"):\n'
+        '        sub = df[(df["dataset"] == ds) & (df[scol] == "test")]\n'
+        '        tp, _ = retrieval.predict_tfidf_proba(tfidf, sub["question"].tolist())\n'
+        '        vp = np.array([v4_probs_by_seed[seed][q] for q in sub["qid"]])\n'
+        '        tfidf_aurocs.append({\n'
+        '            "seed": seed, "dataset": ds,\n'
+        '            "tfidf_auroc": retrieval.compute_trigger_auroc(sub, tp),\n'
+        '            "distilbert_auroc": retrieval.compute_trigger_auroc(sub, vp),\n'
+        '            "v4_infer_ms": lat_ms,\n'
+        '        })\n\n'
+        '    # Free GPU memory cleanly between seeds\n'
+        '    del model\n'
+        '    if torch.cuda.is_available():\n'
+        '        torch.cuda.empty_cache()\n\n'
+        'v4_hist_df = pd.concat(v4_histories, ignore_index=True)\n'
+        'v4_hist_df.to_csv(MET / "task2_v4_training_history.csv", index=False)\n'
+        'pd.DataFrame(v4_pred_rows).to_csv(MET / "task2_v4_predictions.csv", index=False)\n'
+        'display(v4_hist_df.groupby("epoch")[["train_loss", "val_loss", "val_auroc"]].mean().round(4))\n'
+        'display(pd.DataFrame(tfidf_aurocs).groupby("dataset")[["tfidf_auroc", "distilbert_auroc", "v4_infer_ms"]].agg(["mean", "std"]).round(3))'
+    ),
+    md(
+        "## 7. Full comparison & TriviaQA → HotpotQA transfer (V1–V4, seeds 0–2)\n\n"
+        "All methods evaluated across seeds `0, 1, 2` with thresholds tuned strictly on TriviaQA validation "
+        "and transferred unchanged to HotpotQA test (plus HotpotQA in-domain upper reference)."
+    ),
+    code(
+        'all_seed_df, all_summary = retrieval.evaluate_triggers_across_seeds(\n'
+        '    df,\n'
+        '    seeds=SEEDS,\n'
+        '    em_tolerance=EM_TOL,\n'
+        '    v4_probs_by_seed=v4_probs_by_seed,\n'
+        '    v4_latency_ms_by_seed=v4_latency_ms_by_seed,\n'
+        '    weights=COST_WEIGHTS,\n'
+        ')\n'
+        'evaluate.save_results_table(all_seed_df, MET / "task2_results_by_seed.csv")\n'
+        'evaluate.save_results_table(all_summary, MET / "task2_summary.csv")\n'
+        'evaluate.save_results_table(all_summary, MET / "task2_summary_clean.csv", formatted_only=True)\n\n'
+        'clean_tbl = evaluate.format_results_table(all_summary)\n'
+        'main_cols = ["eval_set", "method", "threshold", "EM", "F1", "retrieval_rate",\n'
+        '             "auroc_helps", "retrievals_per_1k", "tokens_per_1k", "cost_per_1k", "mean_latency_ms", "p95_latency_ms"]\n'
+        'print("=== TriviaQA Test (In-Domain) ===")\n'
+        'display(clean_tbl[clean_tbl["eval_set"] == "TriviaQA (in-domain)"][main_cols])\n\n'
+        'print("=== HotpotQA Test: Zero-Retuning Transfer vs In-Domain Reference ===")\n'
+        'transfer_tbl = clean_tbl[clean_tbl["eval_set"].str.startswith("HotpotQA")][main_cols]\n'
+        'transfer_tbl.to_csv(MET / "task2_transfer_table.csv", index=False)\n'
+        'display(transfer_tbl)'
+    ),
+    code(
+        '# Main slide figure: EM & F1 vs Retrieval Rate for V1-V4 (TriviaQA test & HotpotQA transfer)\n'
+        'fig, axes = plt.subplots(2, 2, figsize=(12, 8.2), sharex=True)\n'
+        'palette = {\n'
+        '    "V2 Log-probability": "#1f77b4",\n'
+        '    "V3 Predictive entropy": "#ff7f0e",\n'
+        '    "V4 DistilBERT classifier": "#9467bd",\n'
+        '}\n\n'
+        'seed = 0\n'
+        'tq_val = df[(df["dataset"] == "triviaqa") & (df[f"split_s{seed}"] == "val")].reset_index(drop=True)\n\n'
+        'for col_idx, (ds, ds_title) in enumerate([\n'
+        '    ("triviaqa", "TriviaQA test (in-domain)"),\n'
+        '    ("hotpotqa", "HotpotQA test (TriviaQA threshold, zero retuning)"),\n'
+        ']):\n'
+        '    test_sub = df[(df["dataset"] == ds) & (df[f"split_s{seed}"] == "test")].reset_index(drop=True)\n'
+        '    specs = [\n'
+        '        ("V2 Log-probability", tq_val["direct_logprob"], test_sub["direct_logprob"], "below", False, 0.0),\n'
+        '        ("V3 Predictive entropy", tq_val["direct_entropy"], test_sub["direct_entropy"], "above", False, 0.0),\n'
+        '        ("V4 DistilBERT classifier",\n'
+        '         np.array([v4_probs_by_seed[seed][q] for q in tq_val["qid"]]),\n'
+        '         np.array([v4_probs_by_seed[seed][q] for q in test_sub["qid"]]),\n'
+        '         "above", True, v4_latency_ms_by_seed[seed]),\n'
+        '    ]\n\n'
+        '    for row_idx, metric in enumerate(["EM", "F1"]):\n'
+        '        ax = axes[row_idx, col_idx]\n'
+        '        for name, val_s, test_s, direction, pre_gen, clf_ms in specs:\n'
+        '            c_val = retrieval.sweep_thresholds(tq_val, val_s, direction=direction, is_pre_generation=pre_gen, classifier_latency_ms=clf_ms, weights=COST_WEIGHTS)\n'
+        '            t_star = retrieval.pick_threshold(c_val, always_rag_em=float(tq_val["rag_em"].mean()), em_tolerance=EM_TOL)\n'
+        '            c_test = retrieval.sweep_thresholds(test_sub, test_s, direction=direction, is_pre_generation=pre_gen, classifier_latency_ms=clf_ms, weights=COST_WEIGHTS)\n'
+        '            op = retrieval.evaluate_policy(test_sub, retrieval.apply_threshold(test_s, t_star, direction), is_pre_generation=pre_gen, classifier_latency_ms=clf_ms, weights=COST_WEIGHTS)\n'
+        '            ax.plot(c_test["retrieval_rate"] * 100, c_test[metric] * 100, label=name, color=palette[name], lw=2)\n'
+        '            ax.scatter([op["retrieval_rate"] * 100], [op[metric] * 100], color=palette[name], edgecolor="black", s=70, zorder=5)\n\n'
+        '        never_v = float(test_sub[f"direct_{metric.lower()}"].mean()) * 100\n'
+        '        always_v = float(test_sub[f"rag_{metric.lower()}"].mean()) * 100\n'
+        '        oracle = retrieval.evaluate_oracle(test_sub, weights=COST_WEIGHTS)\n'
+        '        ax.axhline(always_v, color="grey", ls="--", lw=1.2, label=f"V1b Always RAG ({always_v:.1f}%)")\n'
+        '        ax.axhline(never_v, color="grey", ls=":", lw=1.2, label=f"V1a Never RAG ({never_v:.1f}%)")\n'
+        '        ax.scatter([oracle["retrieval_rate"] * 100], [oracle[metric] * 100], marker="*", s=150, color="green", zorder=6, label="Oracle")\n'
+        '        if row_idx == 0:\n'
+        '            ax.set_title(ds_title)\n'
+        '        if col_idx == 0:\n'
+        '            ax.set_ylabel(f"{metric} (%)")\n'
+        '        if row_idx == 1:\n'
+        '            ax.set_xlabel("Retrieval rate (%)")\n'
+        '        ax.grid(alpha=0.25)\n'
+        '        if row_idx == 0:\n'
+        '            ax.legend(fontsize=8, loc="lower right")\n\n'
+        'fig.suptitle("Task 2 · Accuracy (EM & F1) vs. Retrieval Rate (markers = TriviaQA-tuned operating points)", y=1.01)\n'
+        'fig.tight_layout()\n'
+        'fig.savefig(FIG / "task2_em_f1_vs_retrieval.png", dpi=150, bbox_inches="tight")\n'
+        'plt.show()'
+    ),
+    code(
+        '# Efficiency comparison: retrievals/1k, generated tokens/1k, weighted cost/1k, latency (mean +/- std)\n'
+        'order = ["V1a Never retrieve", "V2 Log-probability", "V3 Predictive entropy",\n'
+        '         "V4 DistilBERT classifier", "V1b Always retrieve", "Oracle (cheapest correct)"]\n'
+        'fig, axes = plt.subplots(1, 3, figsize=(14, 4.2))\n'
+        'for ax, metric, ylabel in [\n'
+        '    (axes[0], "retrievals_per_1k", "Retrievals / 1,000 queries"),\n'
+        '    (axes[1], "tokens_per_1k", "Generated tokens / 1,000 queries"),\n'
+        '    (axes[2], "cost_per_1k", "Weighted cost / 1,000 queries"),\n'
+        ']:\n'
+        '    x = np.arange(len(order))\n'
+        '    w_bar = 0.36\n'
+        '    for shift, eval_name, color in [\n'
+        '        (-w_bar / 2, "TriviaQA (in-domain)", "#1f77b4"),\n'
+        '        (w_bar / 2, "HotpotQA (transfer)", "#d62728"),\n'
+        '    ]:\n'
+        '        sub = all_summary[all_summary["eval_set"] == eval_name].set_index("method").reindex(order)\n'
+        '        ax.bar(x + shift, sub[f"{metric}_mean"], w_bar, yerr=sub[f"{metric}_std"],\n'
+        '               capsize=3, label=eval_name, color=color, alpha=0.85)\n'
+        '    ax.set_xticks(x)\n'
+        '    ax.set_xticklabels([m.replace(" ", "\\n") for m in order], fontsize=8)\n'
+        '    ax.set_ylabel(ylabel); ax.grid(axis="y", alpha=0.25)\n'
+        'axes[0].legend(fontsize=8)\n'
+        'fig.suptitle("Task 2 · Efficiency & Cost Breakdown (mean ± std across seeds 0–2)", y=1.02)\n'
+        'fig.tight_layout()\n'
+        'fig.savefig(FIG / "task2_efficiency_cost.png", dpi=150, bbox_inches="tight")\n'
+        'plt.show()'
+    ),
+    md(
+        "## 8. Deeper analysis: calibration, reliability diagrams & confident-but-wrong audit\n\n"
+        "To diagnose **why** thresholds transfer (or fail to transfer) from TriviaQA to HotpotQA, we evaluate "
+        "probability calibration on both datasets:\n"
+        "1. **V2 Raw LLM confidence** (`exp(direct_logprob)` vs empirical `direct_em`) — zero fitting; tests "
+        "whether Qwen2.5 is systematically overconfident on multi-hop HotpotQA questions.\n"
+        "2. **V2 Platt-calibrated `P(retrieval_helps | -logprob)`** — logistic calibrator fitted strictly on TriviaQA validation.\n"
+        "3. **V3 Platt-calibrated `P(retrieval_helps | entropy)`** — logistic calibrator fitted strictly on TriviaQA validation.\n"
+        "4. **V4 DistilBERT `P(retrieval_helps | question)`** — predicted probability from the fine-tuned classifier."
+    ),
+    code(
+        'cal_rows = []\n'
+        'seed0_bins = {}\n\n'
+        'for seed in SEEDS:\n'
+        '    scol = f"split_s{seed}"\n'
+        '    tq_val = df[(df["dataset"] == "triviaqa") & (df[scol] == "val")].reset_index(drop=True)\n'
+        '    platt_lp = retrieval.fit_platt_scaler(tq_val["neg_logprob"], tq_val["retrieval_helps"])\n'
+        '    platt_ent = retrieval.fit_platt_scaler(tq_val["direct_entropy"], tq_val["retrieval_helps"])\n\n'
+        '    for ds in ("triviaqa", "hotpotqa"):\n'
+        '        sub = df[(df["dataset"] == ds) & (df[scol] == "test")].reset_index(drop=True)\n'
+        '        v4_p = np.array([v4_probs_by_seed[seed][q] for q in sub["qid"]])\n'
+        '        checks = [\n'
+        '            ("V2 Raw confidence (vs direct EM)", sub["direct_em"].to_numpy(), sub["direct_conf"].to_numpy()),\n'
+        '            ("V2 Log-prob (Platt -> retr helps)", sub["retrieval_helps"].to_numpy(), retrieval.apply_platt_scaler(platt_lp, sub["neg_logprob"])),\n'
+        '            ("V3 Entropy (Platt -> retr helps)", sub["retrieval_helps"].to_numpy(), retrieval.apply_platt_scaler(platt_ent, sub["direct_entropy"])),\n'
+        '            ("V4 DistilBERT (P -> retr helps)", sub["retrieval_helps"].to_numpy(), v4_p),\n'
+        '        ]\n'
+        '        for label, y_true, y_prob in checks:\n'
+        '            res_cal = retrieval.expected_calibration_error(y_true, y_prob, n_bins=10)\n'
+        '            cal_rows.append({\n'
+        '                "dataset": ds, "model": label, "seed": seed,\n'
+        '                "ECE": res_cal["ece"], "MCE": res_cal["mce"], "Brier": res_cal["brier"],\n'
+        '            })\n'
+        '            if seed == 0:\n'
+        '                seed0_bins[(ds, label)] = res_cal\n\n'
+        'cal_seed_df = pd.DataFrame(cal_rows)\n'
+        'cal_summary = evaluate.aggregate_seed_results(\n'
+        '    cal_seed_df, group_cols=["dataset", "model"], metric_cols=["ECE", "MCE", "Brier"], decimals=3\n'
+        ')\n'
+        'evaluate.save_results_table(cal_summary, MET / "task2_calibration.csv")\n'
+        'display(evaluate.format_results_table(cal_summary))'
+    ),
+    code(
+        '# Reliability diagrams (seed 0): TriviaQA test vs HotpotQA test\n'
+        'model_labels = [\n'
+        '    "V2 Raw confidence (vs direct EM)",\n'
+        '    "V2 Log-prob (Platt -> retr helps)",\n'
+        '    "V3 Entropy (Platt -> retr helps)",\n'
+        '    "V4 DistilBERT (P -> retr helps)",\n'
+        ']\n'
+        'fig, axes = plt.subplots(2, 4, figsize=(15, 6.8), sharex=True, sharey=True)\n'
+        'for r, ds in enumerate(["triviaqa", "hotpotqa"]):\n'
+        '    for c, label in enumerate(model_labels):\n'
+        '        ax = axes[r, c]\n'
+        '        info = seed0_bins[(ds, label)]\n'
+        '        bdf = info["bins_df"]\n'
+        '        non_empty = bdf[bdf["count"] > 0]\n'
+        '        ax.plot([0, 1], [0, 1], "k--", lw=1, label="Perfect")\n'
+        '        ax.bar(bdf["bin_center"], bdf["empirical_accuracy"].fillna(0.0), width=0.09,\n'
+        '               alpha=0.55, edgecolor="black", label="Empirical")\n'
+        '        ax.plot(non_empty["avg_confidence"], non_empty["empirical_accuracy"], "o-", color="#d62728", lw=1.5)\n'
+        '        ax.set_title(f"{ds.upper()} · ECE={info[\'ece\']:.3f}\\n{label}", fontsize=8.5)\n'
+        '        ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.grid(alpha=0.25)\n'
+        '        if c == 0:\n'
+        '            ax.set_ylabel("Empirical frequency")\n'
+        '        if r == 1:\n'
+        '            ax.set_xlabel("Predicted probability")\n\n'
+        'fig.suptitle("Task 2 · Reliability Diagrams: TriviaQA vs. HotpotQA (seed 0)", y=1.01)\n'
+        'fig.tight_layout()\n'
+        'fig.savefig(FIG / "task2_reliability_diagrams.png", dpi=150, bbox_inches="tight")\n'
+        'plt.show()'
+    ),
+    code(
+        '# Confident-but-wrong failure audit (questions where direct was confident & wrong, and RAG fixed it)\n'
+        'pd.set_option("display.max_colwidth", 90)\n'
+        'cw_tq = retrieval.confident_wrong_examples(df, top_k=10, dataset="triviaqa")\n'
+        'cw_hq = retrieval.confident_wrong_examples(df, top_k=10, dataset="hotpotqa")\n'
+        'cw_all = pd.concat([cw_tq, cw_hq], ignore_index=True)\n'
+        'cw_all.to_csv(MET / "task2_confident_wrong_examples.csv", index=False)\n'
+        'print("Top 5 confident-but-wrong HotpotQA examples rescued by RAG:")\n'
+        'display(cw_hq[["qid", "question", "direct_answer", "rag_answer", "direct_conf", "direct_entropy"]].head(5))\n'
+        'print("Top 5 confident-but-wrong TriviaQA examples rescued by RAG:")\n'
+        'display(cw_tq[["qid", "question", "direct_answer", "rag_answer", "direct_conf", "direct_entropy"]].head(5))'
+    ),
+    md(
+        "## 9. Shared final pipeline comparison (Tasks 1–4 vs Always-RAG vs Oracle)\n\n"
+        "Per the 6-day plan (Day 4, Manimegalai), this cell combines the winning decision policy from each "
+        "task against **Always-RAG** and the **Oracle** using Vijaya's shared `dsa4.cost.CostWeights` model "
+        "for the **Shared Opening slide**.\n\n"
+        "- The Task 2 row is populated automatically from this notebook's best trigger.\n"
+        "- On Day 4, plug in the team's final winning numbers from Tasks 1, 3, and 4 into `TEAM_WINNERS` below "
+        "and re-run to export `results/metrics/final_pipeline_comparison.csv`."
+    ),
+    code(
+        '# Automatically extract the best Task 2 trigger (lowest cost_per_1k among triggers on TriviaQA test)\n'
+        't2_candidates = all_summary[\n'
+        '    (all_summary["eval_set"] == "TriviaQA (in-domain)")\n'
+        '    & (all_summary["method"].isin(["V2 Log-probability", "V3 Predictive entropy", "V4 DistilBERT classifier"]))\n'
+        '].sort_values(["EM_mean", "cost_per_1k_mean"], ascending=[False, True])\n'
+        'best_t2_method = t2_candidates.iloc[0]["method"]\n'
+        'print("Best Task 2 trigger on TriviaQA:", best_t2_method)\n\n'
+        '# Pull Task 2 numbers across both datasets\n'
+        'def _row_for(eval_set, method):\n'
+        '    r = all_summary[(all_summary["eval_set"] == eval_set) & (all_summary["method"] == method)].iloc[0]\n'
+        '    return {"EM": r["EM_mean"], "cost_per_1k": r["cost_per_1k_mean"], "retrieval_rate": r["retrieval_rate_mean"]}\n\n'
+        'always_tq = _row_for("TriviaQA (in-domain)", "V1b Always retrieve")\n'
+        'oracle_tq = _row_for("TriviaQA (in-domain)", "Oracle (cheapest correct)")\n'
+        'best_t2_tq = _row_for("TriviaQA (in-domain)", best_t2_method)\n\n'
+        '# Plug in winning rates from Tasks 1, 3, and 4 on Day 4 (set to None if not yet merged)\n'
+        'TEAM_WINNERS = {\n'
+        '    "task1_cache_hit_rate": None,       # e.g. 0.35 (from Naveena Task 1 best rule at 20% repeats)\n'
+        '    "task1_unsafe_reuse": None,         # e.g. 0.018\n'
+        '    "task3_borderline_rate": None,      # e.g. 0.08 (from Meet Task 3)\n'
+        '    "task3_patch_rate": None,           # e.g. 0.03\n'
+        '    "task4_admission_precision": None,  # e.g. 0.90 (from Vijaya Task 4)\n'
+        '}\n\n'
+        'comp_rows = [\n'
+        '    {"system": "Always-Retrieve (no cache)", "EM": always_tq["EM"],\n'
+        '     "cost_per_1k": always_tq["cost_per_1k"], "unsafe_reuse": 0.0},\n'
+        '    {"system": f"Task 2 Best ({best_t2_method}, no cache)", "EM": best_t2_tq["EM"],\n'
+        '     "cost_per_1k": best_t2_tq["cost_per_1k"], "unsafe_reuse": 0.0},\n'
+        '    {"system": "Oracle (cheapest correct, no cache)", "EM": oracle_tq["EM"],\n'
+        '     "cost_per_1k": oracle_tq["cost_per_1k"], "unsafe_reuse": 0.0},\n'
+        ']\n\n'
+        '# When Tasks 1, 3, 4 numbers are plugged in, compute the full combined pipeline row\n'
+        'if TEAM_WINNERS["task1_cache_hit_rate"] is not None:\n'
+        '    h = TEAM_WINNERS["task1_cache_hit_rate"]\n'
+        '    u = TEAM_WINNERS["task1_unsafe_reuse"] or 0.0\n'
+        '    b = TEAM_WINNERS["task3_borderline_rate"] or 0.0\n'
+        '    miss_rate = max(0.0, 1.0 - h - b)\n'
+        '    c_lookup = cost.call_cost("lookup", COST_WEIGHTS)\n'
+        '    c_3b = cost.call_cost("call_3b", COST_WEIGHTS)\n'
+        '    c_ret = cost.call_cost("retrieval", COST_WEIGHTS)\n'
+        '    combined_cost = 1000.0 * (c_lookup + b * (c_ret + c_3b)) + miss_rate * best_t2_tq["cost_per_1k"]\n'
+        '    combined_em = h * (1.0 - u) + (1.0 - h) * best_t2_tq["EM"]\n'
+        '    comp_rows.insert(2, {\n'
+        '        "system": "Combined Pipeline (Best Tasks 1–4)",\n'
+        '        "EM": combined_em,\n'
+        '        "cost_per_1k": combined_cost,\n'
+        '        "unsafe_reuse": u,\n'
+        '    })\n\n'
+        'final_comp = pd.DataFrame(comp_rows).round(3)\n'
+        'final_comp.to_csv(MET / "final_pipeline_comparison.csv", index=False)\n'
+        'display(final_comp)'
+    ),
+    md(
+        "## 10. Discussion, limitations and MVP gateway integration\n\n"
+        "*Fill in your final prose after running the full notebook on Kaggle with the 2,000-question cache:*\n\n"
+        "- **Best Task 2 policy & key numbers:** State the winning trigger (`V2`, `V3`, or `V4`), its EM/F1, "
+        "retrievals saved vs. always-RAG, generated tokens/1k, and AUROC (mean ± std over seeds 0–2).\n"
+        "- **TriviaQA → HotpotQA transfer verdict:** Summarize whether the TriviaQA-tuned threshold held on "
+        "HotpotQA or under-retrieved, backed by the ECE / reliability diagram findings and confident-but-wrong examples.\n"
+        "- **Pre-generation vs. post-generation trade-off:** Highlight that V2/V3 incur a second 7B LLM pass "
+        "on every triggered query, whereas V4 DistilBERT routes before generation with a single LLM call.\n"
+        "- **Limitations (dropped 'could' items):** Direct hidden-state comparison with **CtrlA (Liu et al., 2025)** "
+        "was deferred as a 'could' item because hidden-state probing requires online white-box access rather "
+        "than offline shared-cache evaluation; V4 uses a simplified 2-way binary router rather than 3-way multi-step Adaptive-RAG.\n"
+        "- **MVP gateway integration:** On a cache miss from Task 1, the gateway invokes the winning Task 2 "
+        "trigger to decide between direct generation and top-5 FAISS RAG, logging retrieval rate and latency to the dashboard.\n\n"
+        "### Key references\n"
+        "- Moskvoretskii et al. (ACL 2025). *Adaptive Retrieval Without Self-Knowledge? Bringing Uncertainty Back Home.*\n"
+        "- Jeong et al. (NAACL 2024). *Adaptive-RAG: Learning to Adapt Retrieval-Augmented Large Language Models through Question Complexity.*\n"
+        "- Shah (2026). *Grounded Cache Routing for Retrieval-Augmented Generation.*\n"
+        "- Schroeder et al. (ICLR 2026). *vCache: Verified Semantic Prompt Caching.*"
+    ),
+]
+
+nb = nbf.v4.new_notebook()
+nb.cells = cells
+nb.metadata["kernelspec"] = {"name": "python3", "display_name": "Python 3", "language": "python"}
+out_path = ROOT / "notebooks" / "ManimegalaiKumarPeriyasamy_Retrieval_Trigger.ipynb"
+nbf.write(nb, out_path)
+print(f"wrote {out_path.name} ({len(cells)} cells)")
