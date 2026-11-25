@@ -1,12 +1,11 @@
 """Shared evaluation utilities and results tables for DSA 4 (Tasks 1–4).
 
-Owner: Manimegalai Kumar Periyasamy (Task 2 — Retrieval Trigger)
-
 Builds on `dsa4.text` (`normalize`, `exact_match`) to provide:
   - normalize_answer: SQuAD-style text normalisation (via `dsa4.text.normalize`)
   - exact_match_score: normalised Exact Match (EM) against all accepted aliases
   - token_f1_score: maximum token-level F1 across all accepted aliases
-  - is_safe_reuse: safe-reuse check enforcing Locked Decision #2 (look-alikes are unsafe)
+  - is_safe_reuse: answer-accuracy check for a reused answer (not cache unsafe_reuse;
+    cache tasks use "safe = same question" from `dsa4.reuse` / `dsa4.stream.reuse_is_safe`)
   - score_qa_predictions: batch EM & F1 (excludes look-alikes / missing gold answers)
   - aggregate_seed_results: turns per-seed results (seeds 0–2) into a mean ± std table
   - format_results_table: extracts clean presentation-ready mean ± std columns
@@ -94,12 +93,13 @@ def is_safe_reuse(
     gold_answers: Optional[Union[str, Sequence[str]]],
     is_lookalike: bool = False,
 ) -> bool:
-    """Return True iff reusing `cached_answer` is safe for the incoming question.
+    """Check answer accuracy of a reused cached answer against gold answers/aliases.
 
-    Per DSA 4 shared setup and Locked Decision #2:
-      - Any reuse of a look-alike question is always unsafe.
-      - Otherwise, reuse is safe only if the cached answer matches the new
-        question's gold answers/aliases under normalised exact match.
+    Use this helper **only for answer accuracy**, not for computing cache
+    `unsafe_reuse` (cache tasks use "safe = same question" via `dsa4.reuse`
+    and `dsa4.stream.reuse_is_safe`).
+
+    Per Locked Decision #2, look-alikes have no gold answer and return False.
     """
     if is_lookalike:
         return False

@@ -44,7 +44,8 @@ def test_token_f1_score():
     assert token_f1_score("", [""]) == 1.0
 
 
-def test_lookalike_and_safe_reuse_decision_2():
+def test_lookalike_and_reused_answer_accuracy():
+    # is_safe_reuse checks answer accuracy only (cache unsafe_reuse uses dsa4.reuse)
     assert is_safe_reuse("Paris", ["Paris"], is_lookalike=False) is True
     assert is_safe_reuse("Paris", ["Paris"], is_lookalike=True) is False
     assert is_safe_reuse("Paris", [], is_lookalike=False) is False
